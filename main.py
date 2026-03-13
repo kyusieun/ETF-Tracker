@@ -1,0 +1,226 @@
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import logging
+from pathlib import Path
+
+import pandas as pd
+
+from etf_tracker.config import KOACT, TIME, EtfConfig, get_etf_config
+from etf_tracker.core.diff import DiffConfig, compute_diff
+from etf_tracker.alerts.telegram import (
+    TelegramConfigError,
+    build_diff_message,
+    build_snapshot_message,
+    send_telegram_document,
+    send_telegram_long_message,
+)
+from etf_tracker.etl.koact import parse_koact_holdings
+from etf_tracker.etl.time_etf import parse_time_holdings
+from etf_tracker.etl.koact_download import download_koact_excel
+from etf_tracker.etl.time_download import download_time_excel
+
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "app.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="KoAct / TIME ETF 트래커")
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="대상 일자 (YYYY-MM-DD), 기본: 오늘",
+    )
+    parser.add_argument(
+        "--etf",
+        choices=["koact", "time"],
+        action="append",
+        help="대상 ETF(여러 번 지정 가능). 예: --etf koact --etf time",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="두 ETF 모두 실행",
+    )
+    return parser.parse_args()
+
+
+def _get_target_date(arg_date: str | None) -> dt.date:
+    if arg_date:
+        return dt.date.fromisoformat(arg_date)
+    return dt.date.today()
+
+
+def _iter_previous_dates(date: dt.date, *, max_days: int = 7):
+    for i in range(1, max_days + 1):
+        yield date - dt.timedelta(days=i)
+
+
+def _find_file_for_date(etf: EtfConfig, date: dt.date) -> Path | None:
+    """
+    data/<etf>/ 디렉터리에서 주어진 날짜에 해당하는 파일을 찾는다.
+    우선순위:
+    1) YYYY-MM-DD.* 패턴
+    2) 파일명 안에 YYYYMMDD 문자열이 포함된 경우
+    """
+    if not etf.data_dir.exists():
+        return None
+
+    ymd_dash = date.isoformat()  # YYYY-MM-DD
+    ymd_compact = date.strftime("%Y%m%d")
+
+    candidates: list[Path] = []
+    for path in etf.data_dir.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".xls", ".xlsx"}:
+            continue
+        name = path.name
+        if ymd_dash in name or ymd_compact in name:
+            candidates.append(path)
+
+    if candidates:
+        # 가장 최근 수정된 파일 하나 선택
+        return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+
+    # 정확한 패턴이 없으면 YYYY-MM-DD.* 이름을 기본으로 가정
+    for ext in (".xlsx", ".xls"):
+        guess = etf.data_dir / f"{ymd_dash}{ext}"
+        if guess.exists():
+            return guess
+
+    return None
+
+
+def _find_previous_file(etf: EtfConfig, date: dt.date) -> Path | None:
+    """
+    최대 며칠 전까지(기본 7일) 뒤로 가면서 이전 거래일 파일을 찾는다.
+    """
+    for prev_date in _iter_previous_dates(date, max_days=7):
+        prev_path = _find_file_for_date(etf, prev_date)
+        if prev_path is not None:
+            return prev_path
+    return None
+
+
+def _load_holdings(etf: EtfConfig, path: Path, date: dt.date) -> pd.DataFrame:
+    if etf.slug == "koact":
+        return parse_koact_holdings(path, date=date)
+    if etf.slug == "time":
+        return parse_time_holdings(path, date=date)
+    raise ValueError(f"알 수 없는 ETF slug: {etf.slug}")
+
+
+def process_etf(etf: EtfConfig, date: dt.date) -> None:
+    logger.info("=== %s (%s) 처리 시작: %s ===", etf.name, etf.slug, date)
+
+    etf.data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 우선 웹에서 해당 날짜 엑셀을 다운로드 시도 (이미 있으면 내부에서 스킵)
+    try:
+        if etf.slug == "koact":
+            download_koact_excel(date)
+        elif etf.slug == "time":
+            download_time_excel(date)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("엑셀 자동 다운로드 중 오류 (ETF=%s, date=%s): %s", etf.slug, date, exc)
+
+    # 2) 로컬 data/<etf>/ 에서 파일 검색
+    curr_path = _find_file_for_date(etf, date)
+    if curr_path is None:
+        logger.error(
+            "대상 일자 파일을 찾을 수 없습니다. data/%s/ 폴더에 파일명을 날짜가 포함되도록 옮겨 주세요. (예: %s-.. .xlsx)",
+            etf.slug,
+            date.isoformat(),
+        )
+        return
+
+    curr_df = _load_holdings(etf, curr_path, date)
+    prev_path = _find_previous_file(etf, date)
+    if prev_path is None:
+        logger.warning(
+            "이전 거래일 파일이 없어 기준 스냅샷만 전송합니다. (ETF=%s, date=%s)",
+            etf.slug,
+            date,
+        )
+        try:
+            message = build_snapshot_message(
+                etf_name=etf.name,
+                date=date,
+                holdings=curr_df,
+                top_n=0,
+            )
+            send_telegram_long_message(message)
+            logger.info("텔레그램 스냅샷 알림 전송 완료")
+        except TelegramConfigError as e:
+            logger.error("텔레그램 설정 오류: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("텔레그램 스냅샷 전송 중 오류 발생: %s", e)
+        return
+
+    # 이전 날짜는 파일명에서 추론하거나, 수정 시간으로 대략 추정
+    prev_date = dt.date.fromtimestamp(prev_path.stat().st_mtime)
+    prev_df = _load_holdings(etf, prev_path, prev_date)
+
+    diff = compute_diff(prev_df, curr_df, config=DiffConfig(top_n=10))
+
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+    full_out = reports_dir / f"{etf.slug}_{date.isoformat()}_full.csv"
+    # CSV에는 핵심 컬럼만 남긴다.
+    full_df = diff["full"].copy()
+    desired_cols = [
+        "ticker",
+        "name",
+        "shares_prev",
+        "shares_curr",
+        "weight_prev",
+        "weight_curr",
+    ]
+    existing_cols = [c for c in desired_cols if c in full_df.columns]
+    full_df = full_df[existing_cols]
+    full_df.to_csv(full_out, index=False, encoding="utf-8-sig")
+    logger.info("full diff CSV 저장: %s", full_out)
+
+    # 텔레그램 알림 (요약 메시지 + 전체 CSV 첨부)
+    try:
+        message = build_diff_message(etf_name=etf.name, date=date, diff=diff, top_n=0)
+        send_telegram_long_message(message)
+        send_telegram_document(
+            full_out,
+            caption=f"{etf.name} {date.isoformat()} 전체 diff",
+        )
+        logger.info("텔레그램 알림 및 전체 파일 전송 완료")
+    except TelegramConfigError as e:
+        logger.error("텔레그램 설정 오류: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("텔레그램 전송 중 오류 발생: %s", e)
+
+
+def main() -> None:
+    args = _parse_args()
+    date = _get_target_date(args.date)
+
+    if args.all or not args.etf:
+        targets = [KOACT, TIME]
+    else:
+        targets = [get_etf_config(slug) for slug in args.etf]
+
+    for etf in targets:
+        process_etf(etf, date)
+
+
+if __name__ == "__main__":
+    main()
+
