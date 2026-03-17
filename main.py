@@ -62,9 +62,22 @@ def _get_target_date(arg_date: str | None) -> dt.date:
     return dt.date.today()
 
 
-def _iter_previous_dates(date: dt.date, *, max_days: int = 7):
+def _is_weekday(d: dt.date) -> bool:
+    """월요일(0)~금요일(4)만 True. 토(5), 일(6)은 False."""
+    return d.weekday() < 5
+
+
+def _iter_previous_dates(date: dt.date, *, max_days: int = 14):
+    """대상일 이전 날짜를 하루씩 거꾸로 나열. 주말은 제외하고 평일만 yield."""
+    count = 0
     for i in range(1, max_days + 1):
-        yield date - dt.timedelta(days=i)
+        if count >= 10:
+            break
+        cand = date - dt.timedelta(days=i)
+        if not _is_weekday(cand):
+            continue
+        count += 1
+        yield cand
 
 
 def _find_file_for_date(etf: EtfConfig, date: dt.date) -> Path | None:
@@ -103,14 +116,18 @@ def _find_file_for_date(etf: EtfConfig, date: dt.date) -> Path | None:
     return None
 
 
+# 이전 거래일로 인정할 최소 보유 종목 수 (휴일/주말에 빈 파일이 오는 경우 필터링)
+MIN_HOLDINGS_PREV_DAY = 10
+
+
 def _find_previous_file(etf: EtfConfig, date: dt.date) -> tuple[Path | None, dt.date | None]:
     """
-    최대 며칠 전까지(기본 10일) 뒤로 가면서, 자료가 있는 가장 최근 이전 거래일을 찾는다.
-    주말/휴일에는 자료가 없으므로 그 이전 날짜를 계속 탐색한다.
-    각 후보 날짜에 대해 웹에서 엑셀을 자동 다운로드 시도 후, 파일 존재 여부를 확인한다.
+    최근 이전 평일만 후보로 두고, 자료가 있는 가장 최근 이전 거래일을 찾는다.
+    주말(토·일)은 후보에서 제외하며, 각 후보 날짜에 대해 웹에서 엑셀 다운로드 후
+    파일이 실제로 충분한 보유 종목을 담고 있는지 검사한다.
     반환: (이전일 파일 경로, 이전일 날짜). 없으면 (None, None).
     """
-    for prev_date in _iter_previous_dates(date, max_days=10):
+    for prev_date in _iter_previous_dates(date, max_days=14):
         try:
             if etf.slug == "koact":
                 download_koact_excel(prev_date)
@@ -119,9 +136,22 @@ def _find_previous_file(etf: EtfConfig, date: dt.date) -> tuple[Path | None, dt.
         except Exception as exc:  # noqa: BLE001
             logger.debug("이전일 자동 다운로드 실패(무시하고 계속): %s", exc)
         prev_path = _find_file_for_date(etf, prev_date)
-        if prev_path is not None:
-            logger.info("이전 거래일로 사용: %s (날짜 %s)", prev_path.name, prev_date.isoformat())
-            return (prev_path, prev_date)
+        if prev_path is None:
+            continue
+        try:
+            prev_df = _load_holdings(etf, prev_path, prev_date)
+            if len(prev_df) < MIN_HOLDINGS_PREV_DAY:
+                logger.info(
+                    "이전일 후보 %s: 보유 종목 수 부족(%d) → 건너뜀",
+                    prev_date.isoformat(),
+                    len(prev_df),
+                )
+                continue
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("이전일 파일 파싱 실패(건너뜀): %s", exc)
+            continue
+        logger.info("이전 거래일로 사용: %s (날짜 %s)", prev_path.name, prev_date.isoformat())
+        return (prev_path, prev_date)
     return (None, None)
 
 
