@@ -126,9 +126,11 @@ def build_diff_message(
     date: dt.date,
     diff,
     top_n: int = 10,
+    prev_date: dt.date | None = None,
 ) -> str:
     """
     diff 결과(DataFrame 묶음)를 사람이 읽기 좋은 메시지로 변환한다.
+    prev_date: 비교 기준일(이전 거래일). 있으면 메시지에 표시한다.
     """
     new_df = diff["new_entries"]
     removed_df = diff["removed"]
@@ -136,15 +138,17 @@ def build_diff_message(
     decreased_df = diff["decreased"]
 
     header = f"[{etf_name}] {date.isoformat()} 구성종목 변화 요약"
+    parts = [header, ""]
+    if prev_date is not None:
+        parts.append(f"비교 기준: {prev_date.isoformat()} → {date.isoformat()}")
+        parts.append("")
 
-    parts = [
-        header,
-        "",
+    parts.extend([
         _format_section("신규 편입", new_df, max_rows=0),
         _format_section("편출 종목", removed_df, max_rows=0),
         _format_section("수량 증가", increased_df, max_rows=0),
         _format_section("수량 감소", decreased_df, max_rows=0),
-    ]
+    ])
 
     return "\n".join(parts).strip()
 

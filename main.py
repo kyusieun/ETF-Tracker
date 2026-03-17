@@ -103,15 +103,26 @@ def _find_file_for_date(etf: EtfConfig, date: dt.date) -> Path | None:
     return None
 
 
-def _find_previous_file(etf: EtfConfig, date: dt.date) -> Path | None:
+def _find_previous_file(etf: EtfConfig, date: dt.date) -> tuple[Path | None, dt.date | None]:
     """
-    최대 며칠 전까지(기본 7일) 뒤로 가면서 이전 거래일 파일을 찾는다.
+    최대 며칠 전까지(기본 10일) 뒤로 가면서, 자료가 있는 가장 최근 이전 거래일을 찾는다.
+    주말/휴일에는 자료가 없으므로 그 이전 날짜를 계속 탐색한다.
+    각 후보 날짜에 대해 웹에서 엑셀을 자동 다운로드 시도 후, 파일 존재 여부를 확인한다.
+    반환: (이전일 파일 경로, 이전일 날짜). 없으면 (None, None).
     """
-    for prev_date in _iter_previous_dates(date, max_days=7):
+    for prev_date in _iter_previous_dates(date, max_days=10):
+        try:
+            if etf.slug == "koact":
+                download_koact_excel(prev_date)
+            elif etf.slug == "time":
+                download_time_excel(prev_date)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("이전일 자동 다운로드 실패(무시하고 계속): %s", exc)
         prev_path = _find_file_for_date(etf, prev_date)
         if prev_path is not None:
-            return prev_path
-    return None
+            logger.info("이전 거래일로 사용: %s (날짜 %s)", prev_path.name, prev_date.isoformat())
+            return (prev_path, prev_date)
+    return (None, None)
 
 
 def _load_holdings(etf: EtfConfig, path: Path, date: dt.date) -> pd.DataFrame:
@@ -147,8 +158,8 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
         return
 
     curr_df = _load_holdings(etf, curr_path, date)
-    prev_path = _find_previous_file(etf, date)
-    if prev_path is None:
+    prev_path, prev_date = _find_previous_file(etf, date)
+    if prev_path is None or prev_date is None:
         logger.warning(
             "이전 거래일 파일이 없어 기준 스냅샷만 전송합니다. (ETF=%s, date=%s)",
             etf.slug,
@@ -169,8 +180,6 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
             logger.exception("텔레그램 스냅샷 전송 중 오류 발생: %s", e)
         return
 
-    # 이전 날짜는 파일명에서 추론하거나, 수정 시간으로 대략 추정
-    prev_date = dt.date.fromtimestamp(prev_path.stat().st_mtime)
     prev_df = _load_holdings(etf, prev_path, prev_date)
 
     diff = compute_diff(prev_df, curr_df, config=DiffConfig(top_n=10))
@@ -195,7 +204,13 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
 
     # 텔레그램 알림 (요약 메시지 + 전체 CSV 첨부)
     try:
-        message = build_diff_message(etf_name=etf.name, date=date, diff=diff, top_n=0)
+        message = build_diff_message(
+            etf_name=etf.name,
+            date=date,
+            diff=diff,
+            top_n=0,
+            prev_date=prev_date,
+        )
         send_telegram_long_message(message)
         send_telegram_document(
             full_out,
