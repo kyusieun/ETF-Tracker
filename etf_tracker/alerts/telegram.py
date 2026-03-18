@@ -159,21 +159,27 @@ def build_snapshot_message(
     date: dt.date,
     holdings: pd.DataFrame,
     top_n: int = 10,
+    note: str | None = None,
 ) -> str:
     """
     전일 데이터가 없을 때, 현재 보유 상위 종목 스냅샷을 보내기 위한 메시지.
     """
     header = f"[{etf_name}] {date.isoformat()} 기준 구성종목 스냅샷"
+    lines: list[str] = [header]
+    if note:
+        lines.extend(["", note])
 
     if holdings.empty:
-        return header + "\n(보유 종목이 없습니다.)"
+        lines.append("")
+        lines.append("(보유 종목이 없습니다.)")
+        return "\n".join(lines).strip()
 
     subset = (
         holdings.sort_values("shares", ascending=False)
         if top_n <= 0
         else holdings.sort_values("shares", ascending=False).head(top_n)
     )
-    lines = [header, ""]
+    lines.append("")
     lines.append("상위 보유 종목:")
     for _, row in subset.iterrows():
         name = str(row.get("name", ""))

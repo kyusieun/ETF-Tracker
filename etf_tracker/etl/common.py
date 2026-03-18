@@ -39,6 +39,46 @@ def _choose_column(columns: Iterable[str], candidates: list[str]) -> str:
     raise KeyError(f"컬럼을 찾을 수 없습니다: {candidates}")
 
 
+def _choose_column_optional(columns: Iterable[str], candidates: list[str]) -> str | None:
+    try:
+        return _choose_column(columns, candidates)
+    except KeyError:
+        return None
+
+
+def _clean_numeric(series: "pd.Series") -> "pd.Series":
+    """
+    숫자 컬럼으로 변환하기 전 문자열 정리.
+    - %, 콤마, 공백 등 제거
+    """
+    s = series.astype(str).str.strip()
+    s = s.str.replace(",", "", regex=False)
+    s = s.str.replace("%", "", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _normalize_ticker_value(v: object) -> str:
+    """
+    종목코드 정규화.
+    - 숫자만 있는 경우: 6자리로 zero-pad
+    - 393890.0 같은 형태: 소수점 제거 후 처리
+    - 0009K0 같은 영문 포함 코드는 원형 유지(공백만 제거)
+    """
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan":
+        return ""
+
+    # Excel이 숫자로 읽어 float 문자열(예: 393890.0)로 들어오는 케이스
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+
+    if s.isdigit():
+        return s.zfill(6)
+
+    # 영문/기호 포함이면 원형 유지 (다만 내부 공백은 제거)
+    return s.replace(" ", "")
+
+
 def _find_header_row(raw: pd.DataFrame) -> int:
     """
     '종목코드'와 '종목명'이 포함된 행을 헤더로 간주한다.
@@ -84,16 +124,24 @@ def normalize_holdings_df(
     ticker_col = _choose_column(cols, COLUMN_CANDIDATES["ticker"])
     name_col = _choose_column(cols, COLUMN_CANDIDATES["name"])
     shares_col = _choose_column(cols, COLUMN_CANDIDATES["shares"])
-    mv_col = _choose_column(cols, COLUMN_CANDIDATES["market_value"])
+    mv_col = _choose_column_optional(cols, COLUMN_CANDIDATES["market_value"])
     weight_col = _choose_column(cols, COLUMN_CANDIDATES["weight"])
+
+    ticker_series = df[ticker_col].map(_normalize_ticker_value)
+
+    # 평가금액 컬럼은 일부 ETF(예: PLUS)에는 없을 수 있다.
+    if mv_col is None:
+        market_value_series = pd.Series([pd.NA] * len(df), index=df.index)
+    else:
+        market_value_series = _clean_numeric(df[mv_col])
 
     out = pd.DataFrame(
         {
-            "ticker": df[ticker_col].astype(str).str.strip(),
+            "ticker": ticker_series,
             "name": df[name_col].astype(str).str.strip(),
-            "shares": pd.to_numeric(df[shares_col], errors="coerce"),
-            "market_value": pd.to_numeric(df[mv_col], errors="coerce"),
-            "weight": pd.to_numeric(df[weight_col], errors="coerce"),
+            "shares": _clean_numeric(df[shares_col]),
+            "market_value": market_value_series,
+            "weight": _clean_numeric(df[weight_col]),
         }
     )
 

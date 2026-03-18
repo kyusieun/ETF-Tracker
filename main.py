@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from etf_tracker.config import KOACT, TIME, EtfConfig, get_etf_config
+from etf_tracker.config import KOACT, PLUS150, TIME, EtfConfig, get_etf_config
 from etf_tracker.core.diff import DiffConfig, compute_diff
 from etf_tracker.alerts.telegram import (
     TelegramConfigError,
@@ -17,8 +17,10 @@ from etf_tracker.alerts.telegram import (
     send_telegram_long_message,
 )
 from etf_tracker.etl.koact import parse_koact_holdings
+from etf_tracker.etl.plus150 import parse_plus150_holdings
 from etf_tracker.etl.time_etf import parse_time_holdings
 from etf_tracker.etl.koact_download import download_koact_excel
+from etf_tracker.etl.plus150_download import download_plus150_excel
 from etf_tracker.etl.time_download import download_time_excel
 
 
@@ -44,14 +46,14 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--etf",
-        choices=["koact", "time"],
+        choices=["koact", "time", "plus150"],
         action="append",
         help="대상 ETF(여러 번 지정 가능). 예: --etf koact --etf time",
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="두 ETF 모두 실행",
+        help="지원 ETF 모두 실행",
     )
     return parser.parse_args()
 
@@ -133,6 +135,8 @@ def _find_previous_file(etf: EtfConfig, date: dt.date) -> tuple[Path | None, dt.
                 download_koact_excel(prev_date)
             elif etf.slug == "time":
                 download_time_excel(prev_date)
+            elif etf.slug == "plus150":
+                download_plus150_excel(prev_date)
         except Exception as exc:  # noqa: BLE001
             logger.debug("이전일 자동 다운로드 실패(무시하고 계속): %s", exc)
         prev_path = _find_file_for_date(etf, prev_date)
@@ -160,6 +164,8 @@ def _load_holdings(etf: EtfConfig, path: Path, date: dt.date) -> pd.DataFrame:
         return parse_koact_holdings(path, date=date)
     if etf.slug == "time":
         return parse_time_holdings(path, date=date)
+    if etf.slug == "plus150":
+        return parse_plus150_holdings(path, date=date)
     raise ValueError(f"알 수 없는 ETF slug: {etf.slug}")
 
 
@@ -174,6 +180,8 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
             download_koact_excel(date)
         elif etf.slug == "time":
             download_time_excel(date)
+        elif etf.slug == "plus150":
+            download_plus150_excel(date)
     except Exception as exc:  # noqa: BLE001
         logger.error("엑셀 자동 다운로드 중 오류 (ETF=%s, date=%s): %s", etf.slug, date, exc)
 
@@ -188,6 +196,32 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
         return
 
     curr_df = _load_holdings(etf, curr_path, date)
+
+    # 보호 로직(보수적): PLUS150은 상장 초기/휴장일/데이터 미제공 시에도 파일이 내려올 수 있어
+    # 보유 종목이 비정상적으로 적으면(기본 10개 미만) 비교/이전일 탐색을 진행하지 않는다.
+    if etf.slug == "plus150" and len(curr_df) < MIN_HOLDINGS_PREV_DAY:
+        logger.warning(
+            "현재일 데이터가 비정상적으로 적어 비교를 생략합니다. (ETF=%s, date=%s, holdings=%d)",
+            etf.slug,
+            date,
+            len(curr_df),
+        )
+        try:
+            message = build_snapshot_message(
+                etf_name=etf.name,
+                date=date,
+                holdings=curr_df,
+                top_n=0,
+                note="비교 기준: (현재일 데이터 부족으로 비교 생략)",
+            )
+            send_telegram_long_message(message)
+            logger.info("텔레그램 스냅샷(비교 생략) 전송 완료")
+        except TelegramConfigError as e:
+            logger.error("텔레그램 설정 오류: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("텔레그램 스냅샷 전송 중 오류 발생: %s", e)
+        return
+
     prev_path, prev_date = _find_previous_file(etf, date)
     if prev_path is None or prev_date is None:
         logger.warning(
@@ -201,6 +235,7 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
                 date=date,
                 holdings=curr_df,
                 top_n=0,
+                note="비교 기준: (이전 거래일 데이터 없음)",
             )
             send_telegram_long_message(message)
             logger.info("텔레그램 스냅샷 알림 전송 완료")
@@ -244,7 +279,7 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
         send_telegram_long_message(message)
         send_telegram_document(
             full_out,
-            caption=f"{etf.name} {date.isoformat()} 전체 diff",
+            caption=f"{etf.name} {date.isoformat()} 전체 diff (비교 기준: {prev_date.isoformat()} → {date.isoformat()})",
         )
         logger.info("텔레그램 알림 및 전체 파일 전송 완료")
     except TelegramConfigError as e:
@@ -258,7 +293,7 @@ def main() -> None:
     date = _get_target_date(args.date)
 
     if args.all or not args.etf:
-        targets = [KOACT, TIME]
+        targets = [KOACT, TIME, PLUS150]
     else:
         targets = [get_etf_config(slug) for slug in args.etf]
 
