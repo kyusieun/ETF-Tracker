@@ -60,7 +60,26 @@ def _parse_args() -> argparse.Namespace:
 
 def _get_target_date(arg_date: str | None) -> dt.date:
     if arg_date:
-        return dt.date.fromisoformat(arg_date)
+        try:
+            date = dt.date.fromisoformat(arg_date)
+        except ValueError:
+            raise SystemExit(
+                f"[오류] 날짜 형식이 올바르지 않습니다: '{arg_date}'\n"
+                "       YYYY-MM-DD 형식으로 입력해 주세요. 예: 2025-03-21"
+            )
+        if date > dt.date.today():
+            raise SystemExit(
+                f"[오류] 미래 날짜는 사용할 수 없습니다: {date.isoformat()}\n"
+                f"       오늘 날짜 이하로 입력해 주세요. (오늘: {dt.date.today().isoformat()})"
+            )
+        if not _is_weekday(date):
+            day_name = ["월", "화", "수", "목", "금", "토", "일"][date.weekday()]
+            logger.warning(
+                "입력한 날짜 %s(%s요일)는 주말입니다. 데이터가 없을 수 있습니다.",
+                date.isoformat(),
+                day_name,
+            )
+        return date
     return dt.date.today()
 
 
