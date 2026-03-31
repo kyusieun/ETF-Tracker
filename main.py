@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from etf_tracker.config import KOACT, PLUS150, TIME, EtfConfig, get_etf_config
+from etf_tracker.config import KOACT, PLUS150, TIME, TIME_KOSPI, EtfConfig, get_etf_config
 from etf_tracker.core.diff import DiffConfig, compute_diff
 from etf_tracker.alerts.telegram import (
     TelegramConfigError,
@@ -19,9 +19,11 @@ from etf_tracker.alerts.telegram import (
 from etf_tracker.etl.koact import parse_koact_holdings
 from etf_tracker.etl.plus150 import parse_plus150_holdings
 from etf_tracker.etl.time_etf import parse_time_holdings
+from etf_tracker.etl.time_kospi import parse_time_kospi_holdings
 from etf_tracker.etl.koact_download import download_koact_excel
 from etf_tracker.etl.plus150_download import download_plus150_excel
 from etf_tracker.etl.time_download import download_time_excel
+from etf_tracker.etl.time_kospi_download import download_time_kospi_excel
 
 
 LOG_DIR = Path("logs")
@@ -46,7 +48,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--etf",
-        choices=["koact", "time", "plus150"],
+        choices=["koact", "time", "plus150", "timek"],
         action="append",
         help="대상 ETF(여러 번 지정 가능). 예: --etf koact --etf time",
     )
@@ -156,6 +158,8 @@ def _find_previous_file(etf: EtfConfig, date: dt.date) -> tuple[Path | None, dt.
                 download_time_excel(prev_date)
             elif etf.slug == "plus150":
                 download_plus150_excel(prev_date)
+            elif etf.slug == "timek":
+                download_time_kospi_excel(prev_date)
         except Exception as exc:  # noqa: BLE001
             logger.debug("이전일 자동 다운로드 실패(무시하고 계속): %s", exc)
         prev_path = _find_file_for_date(etf, prev_date)
@@ -185,6 +189,8 @@ def _load_holdings(etf: EtfConfig, path: Path, date: dt.date) -> pd.DataFrame:
         return parse_time_holdings(path, date=date)
     if etf.slug == "plus150":
         return parse_plus150_holdings(path, date=date)
+    if etf.slug == "timek":
+        return parse_time_kospi_holdings(path, date=date)
     raise ValueError(f"알 수 없는 ETF slug: {etf.slug}")
 
 
@@ -201,6 +207,8 @@ def process_etf(etf: EtfConfig, date: dt.date) -> None:
             download_time_excel(date)
         elif etf.slug == "plus150":
             download_plus150_excel(date)
+        elif etf.slug == "timek":
+            download_time_kospi_excel(date)
     except Exception as exc:  # noqa: BLE001
         logger.error("엑셀 자동 다운로드 중 오류 (ETF=%s, date=%s): %s", etf.slug, date, exc)
 
@@ -312,7 +320,7 @@ def main() -> None:
     date = _get_target_date(args.date)
 
     if args.all or not args.etf:
-        targets = [KOACT, TIME, PLUS150]
+        targets = [KOACT, TIME, PLUS150, TIME_KOSPI]
     else:
         targets = [get_etf_config(slug) for slug in args.etf]
 

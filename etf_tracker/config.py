@@ -44,11 +44,20 @@ PLUS150 = EtfConfig(
     download_url=None,
 )
 
+TIME_KOSPI = EtfConfig(
+    code="385720",
+    name="TIME 코스피액티브",
+    slug="timek",
+    data_dir=DATA_DIR / "timek",
+    download_url=None,
+)
+
 
 ETF_BY_SLUG = {
     KOACT.slug: KOACT,
     TIME.slug: TIME,
     PLUS150.slug: PLUS150,
+    TIME_KOSPI.slug: TIME_KOSPI,
 }
 
 

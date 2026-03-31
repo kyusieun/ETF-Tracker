@@ -36,3 +36,4 @@ logs/
 # ---- 윈도우 잡파일 ----
 Thumbs.db
 desktop.ini
+.claude/settings.local.json
